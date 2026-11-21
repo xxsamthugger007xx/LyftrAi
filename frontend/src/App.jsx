@@ -3,6 +3,9 @@ import Markdown from "./Markdown.jsx";
 
 const API = (import.meta.env.VITE_API_URL || "http://localhost:8000").replace(/\/$/, "");
 
+const REQUEST_TIMEOUT_MS = 90_000; // covers a Render cold start (~50 s) plus a slow model call
+const HEALTH_TIMEOUT_MS = 90_000;
+
 const newSessionId = () =>
   "s-" + (crypto.randomUUID ? crypto.randomUUID().slice(0, 12) : Math.random().toString(36).slice(2, 14));
 
@@ -29,7 +32,7 @@ const Svg = ({ name, size = 14 }) => (
   </svg>
 );
 
-function Metadata({ meta }) {
+function Metadata({ meta, clientMs }) {
   const cached = meta.resolution_source === "LLM_CACHE";
   return (
     <div className="meta">
@@ -39,9 +42,14 @@ function Metadata({ meta }) {
       <span className="chip" title="Model">
         <Svg name="chip" /> <span data-testid="meta-model">{meta.model}</span>
       </span>
-      <span className="chip" title="Latency">
+      <span className="chip" title="Backend latency (server-measured, from the API response)">
         <Svg name="clock" /> <span data-testid="meta-latency">{meta.latency_ms} ms</span>
       </span>
+      {clientMs != null && (
+        <span className="chip subtle" title="Client-observed round trip: network + any server wake-up + backend (diagnostic)">
+          client <span data-testid="meta-client-latency">{clientMs} ms</span>
+        </span>
+      )}
       <span className="chip" title="Input tokens (this request)">
         in <b data-testid="meta-input-tokens">{meta.input_tokens}</b>
       </span>
@@ -58,14 +66,69 @@ function Metadata({ meta }) {
   );
 }
 
+function Pending({ service, retrying }) {
+  const [secs, setSecs] = useState(0);
+  useEffect(() => {
+    const t0 = Date.now();
+    const id = setInterval(() => setSecs(Math.floor((Date.now() - t0) / 1000)), 1000);
+    return () => clearInterval(id);
+  }, []);
+  // Only states the client can actually know: whether the service has been confirmed reachable, and elapsed time.
+  const label = service === "ready" ? "Waiting for the model's response…" : "Connecting to AI service…";
+  return (
+    <span className="pending">
+      <span className="dots"><i /><i /><i /></span>
+      <span className="pending-text">
+        {retrying ? "Retrying · " : ""}{label}
+        {secs >= 3 && <span className="pending-secs"> {secs}s</span>}
+      </span>
+      {secs >= 12 && (
+        <span className="pending-note">
+          {service === "ready"
+            ? "Taking longer than usual — the model is responding slowly."
+            : "The free server may be waking up — this can take up to a minute."}
+        </span>
+      )}
+    </span>
+  );
+}
+
+const SERVICE_TEXT = {
+  connecting: "Connecting to AI service…",
+  ready: "AI service ready",
+  unreachable: "AI service unreachable",
+};
+
 export default function App() {
   const [sessionId, setSessionId] = useState(newSessionId); // new session on every page load
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [systemPrompt, setSystemPrompt] = useState("");
   const [sending, setSending] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const [service, setService] = useState("connecting"); // connecting | ready | unreachable
   const endRef = useRef(null);
   const inputRef = useRef(null);
+  const inFlight = useRef(false);      // synchronous guard: state alone could let a fast double-submit through
+  const abortRef = useRef(null);       // controller of the request currently in flight
+  const sessionRef = useRef(sessionId);
+
+  // One lightweight health check on load (wakes a sleeping free-tier backend). Never polls, never calls the model.
+  useEffect(() => {
+    let alive = true;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), HEALTH_TIMEOUT_MS);
+    fetch(`${API}/health`, { signal: ctrl.signal })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("bad status"))))
+      .then((d) => alive && setService(d && d.status === "ok" ? "ready" : "unreachable"))
+      .catch(() => alive && setService("unreachable"))
+      .finally(() => clearTimeout(timer));
+    return () => {
+      alive = false;
+      clearTimeout(timer);
+      ctrl.abort();
+    };
+  }, []);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -78,38 +141,77 @@ export default function App() {
     el.style.height = Math.min(el.scrollHeight, 160) + "px";
   }, [input]);
 
-  async function send(textOverride) {
-    const text = (textOverride ?? input).trim();
-    if (!text || sending) return;
-    setInput("");
+  async function submit(text, { retry = false } = {}) {
+    if (!text || inFlight.current) return; // exactly one request per submission
+    inFlight.current = true;
+    const sid = sessionRef.current;
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, REQUEST_TIMEOUT_MS);
+
+    if (!retry) setInput("");
     setSending(true);
-    setMessages((m) => [...m, { role: "user", content: text }]);
+    setRetrying(retry);
+    setMessages((m) => (retry ? m.filter((x) => x.role !== "error") : [...m, { role: "user", content: text }]));
+
+    const fail = (content) => setMessages((m) => [...m, { role: "error", content, retryText: text }]);
+    const t0 = performance.now();
     try {
-      const body = { session_id: sessionId, message: text };
+      const body = { session_id: sid, message: text };
       if (systemPrompt.trim()) body.system_prompt = systemPrompt.trim();
       const res = await fetch(`${API}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
+        signal: ctrl.signal,
       });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        const detail = typeof data.detail === "string" ? data.detail : "Request failed";
-        setMessages((m) => [...m, { role: "error", content: `${detail} (HTTP ${res.status}). Your message was not saved — please try again.` }]);
+      const data = await res.json().catch(() => null);
+      const clientMs = Math.round(performance.now() - t0);
+      if (sessionRef.current !== sid) return; // user started a new chat meanwhile: drop the late reply
+      if (res.status === 422) {
+        fail(`The message was rejected: ${typeof data?.detail === "string" ? data.detail : "invalid input"}.`);
+      } else if (res.status === 503) {
+        fail("The AI providers are temporarily unavailable. Your message was not saved — please retry in a moment.");
+      } else if (!res.ok) {
+        fail(`The server returned an error (HTTP ${res.status}${typeof data?.detail === "string" ? `: ${data.detail}` : ""}).`);
+      } else if (!data || typeof data.reply !== "string" || !data.metadata || typeof data.metadata.resolution_source !== "string") {
+        fail("The server sent a response in an unexpected format.");
       } else {
-        setMessages((m) => [...m, { role: "assistant", content: data.reply, meta: data.metadata }]);
+        setService("ready");
+        setMessages((m) => [...m, { role: "assistant", content: data.reply, meta: data.metadata, clientMs }]);
       }
-    } catch {
-      setMessages((m) => [...m, { role: "error", content: "Could not reach the server. Check your connection and try again." }]);
+    } catch (err) {
+      if (sessionRef.current !== sid) return;
+      if (timedOut) fail(`No response after ${REQUEST_TIMEOUT_MS / 1000} seconds. The free server may be waking up or the model is very slow.`);
+      else if (err?.name === "AbortError") fail("The request was cancelled.");
+      else fail("Could not reach the server. Check your connection and try again.");
     } finally {
-      setSending(false);
-      inputRef.current?.focus();
+      clearTimeout(timer);
+      if (abortRef.current === ctrl) {
+        abortRef.current = null;
+        inFlight.current = false;
+        setSending(false);
+        setRetrying(false);
+        inputRef.current?.focus();
+      }
     }
   }
 
+  const send = (textOverride) => submit((textOverride ?? input).trim());
+  const retryLast = (text) => submit(text, { retry: true });
+
   function newChat() {
+    abortRef.current?.abort(); // cancel any pending reply so it cannot land in the new chat
+    abortRef.current = null;
+    inFlight.current = false;
+    const sid = newSessionId();
+    sessionRef.current = sid;
     setMessages([]);
-    setSessionId(newSessionId());
+    setSending(false);
+    setRetrying(false);
+    setSessionId(sid);
+    inputRef.current?.focus();
   }
 
   return (
@@ -123,6 +225,9 @@ export default function App() {
           </div>
         </div>
         <div className="actions">
+          <span className={`service ${service}`} role="status" title="Backend health check (GET /health)">
+            <i className="svc-dot" /> {SERVICE_TEXT[service]}
+          </span>
           <span className="session" title="Current session id">
             <Svg name="db" /> {sessionId}
           </span>
@@ -170,6 +275,11 @@ export default function App() {
                 <div key={i} className="row">
                   <div className="notice" role="alert">
                     <Svg name="alert" size={16} /> <span>{m.content}</span>
+                    {m.retryText && i === messages.length - 1 && (
+                      <button className="retry" onClick={() => retryLast(m.retryText)} disabled={sending}>
+                        Retry
+                      </button>
+                    )}
                   </div>
                 </div>
               );
@@ -178,7 +288,7 @@ export default function App() {
                 <div className="avatar"><Svg name="bolt" size={14} /></div>
                 <div className="bubble assistant" data-testid="assistant-message">
                   <div className="text"><Markdown text={m.content} /></div>
-                  <Metadata meta={m.meta} />
+                  <Metadata meta={m.meta} clientMs={m.clientMs} />
                 </div>
               </div>
             );
@@ -187,7 +297,7 @@ export default function App() {
           {sending && (
             <div className="row">
               <div className="avatar"><Svg name="bolt" size={14} /></div>
-              <div className="bubble assistant"><span className="dots"><i /><i /><i /></span></div>
+              <div className="bubble assistant"><Pending service={service} retrying={retrying} /></div>
             </div>
           )}
           <div ref={endRef} />

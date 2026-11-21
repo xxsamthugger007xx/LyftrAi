@@ -97,3 +97,21 @@ h1 { margin: 0; font-size: 1.05rem; letter-spacing: -.01em; }
 .send:disabled { opacity: .45; cursor: not-allowed; }
 @media (max-width: 480px) { .send span { display: none; } }
 .hint { margin: 6px 0 0; text-align: center; font-size: .72rem; color: var(--muted); }
+
+/* ---- service status + pending + retry (additions; existing look unchanged) ---- */
+.service { display: inline-flex; align-items: center; gap: 6px; font-size: .75rem; color: var(--muted); padding: 4px 10px;
+  border: 1px solid var(--border); border-radius: 999px; background: var(--surface); }
+.svc-dot { width: 7px; height: 7px; border-radius: 50%; background: #f5a524; animation: blink 1.2s infinite ease-in-out; }
+.service.ready .svc-dot { background: #22c55e; animation: none; }
+.service.unreachable .svc-dot { background: #ef4444; animation: none; }
+.pending { display: inline-flex; flex-direction: column; gap: 4px; }
+.pending > .dots { padding: 2px; }
+.pending-text { font-size: .85rem; color: var(--muted); }
+.pending-secs { font-variant-numeric: tabular-nums; opacity: .8; }
+.pending-note { font-size: .75rem; color: var(--cache-fg); }
+.notice { flex-wrap: wrap; }
+.retry { margin-left: auto; padding: 4px 12px; font-size: .8rem; font-weight: 600; color: var(--err-fg); background: transparent;
+  border: 1px solid var(--err-bd); border-radius: 8px; }
+.retry:hover:not(:disabled) { background: var(--err-bd); }
+.retry:disabled { opacity: .5; cursor: not-allowed; }
+@media (max-width: 560px) { .service { order: 3; } }

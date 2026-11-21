@@ -13,7 +13,7 @@ class Settings:
         self.simulation_enabled = _bool("ENABLE_FAILURE_SIMULATION")
         self.model = os.getenv("LLM_MODEL", "gemini/gemini-3.1-flash-lite")
         self.default_system_prompt = os.getenv("DEFAULT_SYSTEM_PROMPT", "You are a helpful assistant.")
-        self.request_timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "30"))
+        self.request_timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "12"))
         self.cache_enabled = _bool("CACHE_ENABLED", True)
 
     @property

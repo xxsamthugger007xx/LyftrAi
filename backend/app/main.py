@@ -1,7 +1,9 @@
 import asyncio
+import json
 import logging
+import time
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -14,6 +16,25 @@ from .llm import AllProvidersUnavailable, LLMGateway, parse_simulation
 logging.basicConfig(level=logging.INFO)
 for _n in ("httpx", "LiteLLM", "litellm"):
     logging.getLogger(_n).setLevel(logging.WARNING)  # httpx logs URLs that contain the API key
+
+
+timing_log = logging.getLogger("lyftr.timing")
+
+
+def _ms(start: float) -> float:
+    return round((time.perf_counter() - start) * 1000, 2)
+
+
+def _server_timing(t: dict) -> str:
+    return ", ".join(f"{k[:-3]};dur={v}" for k, v in t.items())
+
+
+def _log_timing(event, status, session_id, source, key_id, attempts, timings, reasons=None) -> None:
+    """One JSON line per request. Never contains keys, prompts or replies."""
+    timing_log.info(json.dumps({
+        "event": event, "status": status, "session_id": session_id[:16], "source": source,
+        "key_id": key_id, "fallback_attempts": attempts, **timings, **({"failures": reasons} if reasons else {}),
+    }))
 
 
 LANDING = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -112,31 +133,51 @@ def create_app(settings: Settings | None = None, gateway: LLMGateway | None = No
         return {"status": "ok", "keys_configured": len(gateway.keys), "cache_enabled": settings.cache_enabled}
 
     @app.post("/chat")
-    async def chat(req: ChatRequest, x_simulate_failure: str | None = Header(default=None)):
+    async def chat(req: ChatRequest, response: Response, x_simulate_failure: str | None = Header(default=None)):
+        t_start = time.perf_counter()
         sid = req.session_id
-        stored_prompt = await asyncio.to_thread(db.get_system_prompt, sid)
+
+        t = time.perf_counter()
+        stored_prompt, history = await asyncio.to_thread(db.load_context, sid)  # one thread hop, one connection
+        history_ms = _ms(t)
+
         system_prompt = req.system_prompt or stored_prompt or settings.default_system_prompt
-        history = await asyncio.to_thread(db.history, sid)
         messages = (
             [{"role": "system", "content": system_prompt}]
             + [{"role": m["role"], "content": m["content"]} for m in history]
             + [{"role": "user", "content": req.message}]
         )
         simulate = parse_simulation(x_simulate_failure) if settings.simulation_enabled else {}
+
         try:
             result = await gateway.complete(messages, simulate)
-        except AllProvidersUnavailable:
-            raise HTTPException(status_code=503, detail="all providers unavailable")
+        except AllProvidersUnavailable as exc:
+            timings = {"total_ms": _ms(t_start), "history_ms": history_ms, **exc.timings}
+            _log_timing("chat", 503, sid, None, None, None, timings, exc.reasons)
+            raise HTTPException(
+                status_code=503,
+                detail="all providers unavailable",
+                headers={"Server-Timing": _server_timing(timings)},
+            )
+
+        # Server-measured time for this request (history load + cache lookup + inference), before persistence.
+        latency_ms = int((time.perf_counter() - t_start) * 1000)
         metadata = {
             "resolution_source": result.resolution_source,
             "model": result.model,
-            "latency_ms": result.latency_ms,
+            "latency_ms": latency_ms,
             "input_tokens": result.input_tokens,
             "output_tokens": result.output_tokens,
             "key_id": result.key_id,
             "fallback_attempts": result.fallback_attempts,
         }
+        t = time.perf_counter()
         await asyncio.to_thread(db.add_exchange, sid, req.system_prompt, req.message, result.reply, metadata)
+        persist_ms = _ms(t)
+
+        timings = {"total_ms": _ms(t_start), "history_ms": history_ms, **result.timings, "persist_ms": persist_ms}
+        _log_timing("chat", 200, sid, result.resolution_source, result.key_id, result.fallback_attempts, timings)
+        response.headers["Server-Timing"] = _server_timing(timings)
         return {"session_id": sid, "reply": result.reply, "metadata": metadata}
 
     @app.get("/sessions/{session_id}/messages")

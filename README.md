@@ -30,6 +30,11 @@ Backend tests: `make test` (provider is mocked).
 - **Failure simulation**: `X-Simulate-Failure` is honored only if `ENABLE_FAILURE_SIMULATION=true`. A simulated request skips cache reads so failover can be shown on an already-cached message.
 - Errors are always JSON `{"detail": ...}`; unhandled exceptions return a generic 500 without a trace.
 
+## Performance and reliability notes
+- **Bounded requests**: each key attempt has a hard timeout (`LLM_TIMEOUT_SECONDS`, default 12 s, enforced by LiteLLM and again by `asyncio.wait_for`), so a stalled provider can delay failover by at most ~12 s and a request can never hang (worst case ≈ 12 s × number of keys, then a clean 503).
+- **Timing instrumentation**: every `/chat` writes one JSON log line (`lyftr.timing`) with `total_ms`, `history_ms`, `cache_lookup_ms`, `inference_ms`, `cache_store_ms`, `persist_ms`, plus the same data in a `Server-Timing` response header. Logs never contain keys, prompts or replies.
+- **Frontend**: a single `/health` call on load shows "Connecting to AI service… / AI service ready"; each reply shows the backend `latency_ms` and, separately, the client-observed round trip. Requests time out after 90 s with a Retry option.
+
 ## 4. Verification
 ```bash
 B=http://localhost:8000
