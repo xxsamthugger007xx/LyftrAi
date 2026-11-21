@@ -60,6 +60,16 @@ def create_app(settings: Settings | None = None, gateway: LLMGateway | None = No
         logging.exception("unhandled error")
         return JSONResponse(status_code=500, content={"detail": "internal server error"})
 
+    @app.get("/", include_in_schema=False)
+    async def root():
+        return {
+            "service": "Lyftr Chat API",
+            "status": "ok",
+            "health": "/health",
+            "docs": "/docs",
+            "endpoints": ["GET /health", "POST /chat", "GET /sessions/{session_id}/messages"],
+        }
+
     @app.get("/health")
     async def health():
         await asyncio.to_thread(db.ping)
