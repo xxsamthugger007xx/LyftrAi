@@ -4,7 +4,7 @@ import logging
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from .config import Settings
@@ -14,6 +14,37 @@ from .llm import AllProvidersUnavailable, LLMGateway, parse_simulation
 logging.basicConfig(level=logging.INFO)
 for _n in ("httpx", "LiteLLM", "litellm"):
     logging.getLogger(_n).setLevel(logging.WARNING)  # httpx logs URLs that contain the API key
+
+
+LANDING = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lyftr Chat API</title><style>
+:root{--bg:#f6f7fb;--card:#fff;--text:#121826;--muted:#667089;--bd:#e2e6f0;--p:#4f46e5}
+@media(prefers-color-scheme:dark){:root{--bg:#0c0f17;--card:#151a26;--text:#e8ebf5;--muted:#8b95b0;--bd:#262d3f;--p:#8b83ff}}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:20px;background:var(--bg);color:var(--text);
+font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif}
+.card{width:100%;max-width:560px;background:var(--card);border:1px solid var(--bd);border-radius:18px;padding:32px;box-shadow:0 8px 30px rgba(16,24,40,.08)}
+.logo{width:44px;height:44px;border-radius:12px;display:grid;place-items:center;color:#fff;background:linear-gradient(135deg,#4f46e5,#7c3aed);margin-bottom:14px}
+h1{margin:0 0 4px;font-size:1.5rem;letter-spacing:-.02em}p{margin:0 0 18px;color:var(--muted)}
+.status{display:inline-flex;align-items:center;gap:8px;padding:4px 12px;border-radius:999px;background:#e4f6ec;color:#166a3b;font-weight:600;font-size:.82rem;margin-bottom:18px}
+.dot{width:8px;height:8px;border-radius:50%;background:#22c55e}
+.row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:22px}
+.btn{padding:9px 16px;border-radius:10px;border:1px solid var(--bd);text-decoration:none;color:var(--text);font-weight:600;font-size:.9rem}
+.btn.primary{background:var(--p);border-color:var(--p);color:#fff}
+table{width:100%;border-collapse:collapse;font-size:.88rem}td{padding:8px 0;border-top:1px solid var(--bd)}
+td:first-child{width:70px;font-weight:700;color:var(--p)}code{font:.85em ui-monospace,Menlo,monospace}
+.foot{margin-top:18px;font-size:.78rem;color:var(--muted)}
+</style></head><body><div class="card">
+<div class="logo"><svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8Z"/></svg></div>
+<h1>Lyftr Chat API</h1><p>LLM chatbot backend with API key failover and response caching.</p>
+<div class="status"><span class="dot"></span>Operational &middot; {{KEYS}} keys in pool</div>
+<div class="row">{{FRONTEND}}<a class="btn" href="/docs">API docs</a><a class="btn" href="/health">/health</a></div>
+<table>
+<tr><td>GET</td><td><code>/health</code> &mdash; service status</td></tr>
+<tr><td>POST</td><td><code>/chat</code> &mdash; send a message in a session</td></tr>
+<tr><td>GET</td><td><code>/sessions/{session_id}/messages</code> &mdash; stored history</td></tr>
+</table>
+<div class="foot">FastAPI &middot; LiteLLM &middot; SQLite</div>
+</div></body></html>"""
 
 
 class ChatRequest(BaseModel):
@@ -61,14 +92,19 @@ def create_app(settings: Settings | None = None, gateway: LLMGateway | None = No
         return JSONResponse(status_code=500, content={"detail": "internal server error"})
 
     @app.get("/", include_in_schema=False)
-    async def root():
-        return {
+    async def root(request: Request):
+        info = {
             "service": "Lyftr Chat API",
             "status": "ok",
             "health": "/health",
             "docs": "/docs",
             "endpoints": ["GET /health", "POST /chat", "GET /sessions/{session_id}/messages"],
         }
+        if "text/html" not in request.headers.get("accept", ""):
+            return info
+        public = [o for o in settings.allowed_origins if "localhost" not in o and "127.0.0.1" not in o]
+        frontend = f'<a class="btn primary" href="{public[0]}">Open the chat app</a>' if public else ""
+        return HTMLResponse(LANDING.replace("{{FRONTEND}}", frontend).replace("{{KEYS}}", str(len(gateway.keys))))
 
     @app.get("/health")
     async def health():
